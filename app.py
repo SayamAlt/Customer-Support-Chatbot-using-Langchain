@@ -15,6 +15,8 @@ import streamlit as st
 # Load the environment variables
 load_dotenv()
 
+st.info(st.secrets)
+
 # Load the OpenAI API key
 if "OPENAI_API_KEY" in st.secrets["secrets"]:
     api_key = st.secrets["secrets"]["OPENAI_API_KEY"]
