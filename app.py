@@ -2,20 +2,19 @@ from langchain.document_loaders import JSONLoader
 from langchain.text_splitter import CharacterTextSplitter
 from langchain.embeddings.openai import OpenAIEmbeddings
 from dotenv import load_dotenv
-import os, json, warnings, re
+import os, json, warnings, re, time
 from pinecone import Pinecone, ServerlessSpec
-from langchain.vectorstores import Pinecone as LangchainPinecone
 from langchain.chains import ConversationalRetrievalChain, LLMChain
 from langchain.chat_models.openai import ChatOpenAI
 from langchain.memory import ConversationBufferMemory
+from langchain_pinecone import PineconeVectorStore
 from langchain.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 import streamlit as st
+from uuid import uuid4
 
 # Load the environment variables
 load_dotenv()
-
-st.info(st.secrets)
 
 # Load the OpenAI API key
 if "OPENAI_API_KEY" in st.secrets["secrets"]:
@@ -41,6 +40,20 @@ pc = Pinecone(api_key=pinecone_api_key)
 
 # Define the Pinecone index name
 index_name = "chatbot-index"
+
+existing_indexes = [index_info["name"] for index_info in pc.list_indexes()]
+
+if index_name not in existing_indexes:
+    pc.create_index(
+        name=index_name,
+        dimension=3072,
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+    )
+    while not pc.describe_index(index_name).status["ready"]:
+        time.sleep(1)
+
+index = pc.Index(index_name)
 
 # Initialize the embeddings model
 llm = ChatOpenAI(openai_api_key=api_key)
@@ -105,7 +118,13 @@ if index_name not in [i.name for i in pc.list_indexes()]:
 index = pc.Index(index_name)
 
 # Store the embeddings in the Pinecone vector store
-vector_store = LangchainPinecone.from_documents(splitted_docs,embeddings,index_name=index_name)
+vector_store = PineconeVectorStore(index=index, embedding=embeddings)
+
+# Generate UUIDs for the documents
+uuids = [str(uuid4()) for _ in range(len(documents))]
+
+# Add documents to the vector store
+vector_store.add_documents(documents=splitted_docs, ids=uuids)
 
 # Get the retriever from Pinecone vector store
 retriever = vector_store.as_retriever()

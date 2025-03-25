@@ -2,6 +2,8 @@ langchain
 streamlit
 python-dotenv
 langchain-community
+langchain-pinecone
 openai
 jq
 pinecone
+uuid
