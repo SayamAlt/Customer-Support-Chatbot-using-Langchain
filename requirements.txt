@@ -6,3 +6,4 @@ openai
 jq
 chromadb
 pysqlite3
+sqlite3
