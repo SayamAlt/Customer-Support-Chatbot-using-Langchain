@@ -6,4 +6,4 @@ openai
 jq
 chromadb
 pysqlite3-binary
-sqlite
+sqlite3==3.43.2
