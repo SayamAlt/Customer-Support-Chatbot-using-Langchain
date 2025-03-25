@@ -4,6 +4,4 @@ python-dotenv
 langchain-community
 openai
 jq
-chromadb
-pysqlite3
-sqlite3
+pinecone

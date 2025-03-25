@@ -2,12 +2,14 @@ from langchain.document_loaders import JSONLoader
 from langchain.text_splitter import CharacterTextSplitter
 from langchain.embeddings.openai import OpenAIEmbeddings
 from dotenv import load_dotenv
-import os, json, warnings
-from langchain.vectorstores import Chroma
-from langchain.chains import ConversationalRetrievalChain
+import os, json, warnings, re
+from pinecone import Pinecone, ServerlessSpec
+from langchain.vectorstores import Pinecone as LangchainPinecone
+from langchain.chains import ConversationalRetrievalChain, LLMChain
 from langchain.chat_models.openai import ChatOpenAI
 from langchain.memory import ConversationBufferMemory
 from langchain.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 import streamlit as st
 
 # Load the environment variables
@@ -23,7 +25,26 @@ if not api_key:
     st.error('Missing OpenAI API key. Please set it in the environment variables.')
     st.stop()
 
+if "PINECONE_API_KEY" in st.secrets["secrets"]:
+    pinecone_api_key = st.secrets["secrets"]["PINECONE_API_KEY"]
+else:
+    pinecone_api_key = os.getenv("PINECONE_API_KEY")
+
+if not pinecone_api_key:
+    st.error("Missing Pinecone API credentials. Set them in the environment variables.")
+    st.stop()
+
+# Initialize Pinecone
+pc = Pinecone(api_key=pinecone_api_key)
+
+# Define the Pinecone index name
+index_name = "chatbot-index"
+
+# Initialize the embeddings model
 llm = ChatOpenAI(openai_api_key=api_key)
+
+# Initialize the output parser
+parser = StrOutputParser()
 
 # Load the Customer Support FAQs JSON data
 faq_file = "customer_support_faqs.json"
@@ -69,38 +90,44 @@ splitted_docs = text_splitter.split_documents(documents)
 # Initialize the OpenAI embeddings
 embeddings = OpenAIEmbeddings(api_key=api_key)
 
-persist_directory = './customer_support_db'
-
-# Load or create Chroma vector store
-if not os.path.exists(persist_directory):
-    chroma = Chroma.from_documents(
-        documents=splitted_docs, embedding=embeddings, persist_directory=persist_directory
+# Ensure that Pinecone index exists
+if index_name not in [i.name for i in pc.list_indexes()]:
+    pc.create_index(
+        name=index_name,
+        dimension=1536,  # OpenAI embeddings dimension
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region="us-east-1")
     )
-    chroma.persist()
-else:
-    chroma = Chroma(persist_directory=persist_directory, embedding_function=embeddings)
 
-# Get the retriever from Chroma vector store
-retriever = chroma.as_retriever()
+# Connect to the index
+index = pc.Index(index_name)
+
+# Store the embeddings in the Pinecone vector store
+vector_store = LangchainPinecone.from_documents(splitted_docs,embeddings,index_name=index_name)
+
+# Get the retriever from Pinecone vector store
+retriever = vector_store.as_retriever()
 
 # Initialize Conversation Buffer Memory to store conversational history
 memory = ConversationBufferMemory(memory_key='chat_history', return_messages=True, k=5)
 
 # Define the Prompt Template
 prompt = """
-    You are an AI-powered customer support assistant with a natural, conversational tone. Your goal is to engage in human-like interactions while staying informative and efficient.
+    You are an AI customer support assistant with a conversational tone, focused on being informative and efficient.
 
     Guidelines:
-    - If the user asks general questions (e.g., "How are you?"), respond naturally instead of redirecting immediately to assistance.  
-    - Maintain a casual yet professional tone. Adapt based on user behavior (friendly if casual, formal if professional).  
-    - Avoid sounding robotic. Use natural human-like phrasing.  
-    - Be concise and solution-oriented. No unnecessary repetition.  
-    - Express empathy when needed (e.g., concerns, complaints, delays) but avoid overuse of apologies.  
-    - For follow-ups, ensure continuity instead of restarting every response from scratch.  
-    - If information is unavailable, suggest practical alternatives or next steps.  
 
-    Answer the following user query based on above guidelines:\n{question}\n
+        - For casual questions (e.g., "How are you?"), respond naturally before offering assistance.
+        - Use a casual tone for friendly users, and formal for professional ones.
+        - Avoid sounding robotic—aim for natural, human-like phrasing.
+        - Be concise, avoiding repetition or unnecessary details.
+        - Show empathy when needed but avoid excessive apologies.
+        - Maintain continuity in follow-up conversations.
+        - If info is unavailable, suggest practical alternatives or next steps.
+
     Context from Previous Conversation:\n{context}\n
+    Chat History:\n{chat_history}
+    Answer user's query based on the guidelines, context, and chat history:\n{question}\n
 """
 
 # Define the Conversational Retrieval Chain
@@ -117,6 +144,14 @@ for message in st.session_state.messages:
     with st.chat_message(message['role']):
         st.markdown(message['content'])
 
+def is_greeting(query):
+    greeting_keywords = ["hello", "hi", "hey", "how are you", "good morning", "good afternoon", "good evening", "what's up"]
+    query_lower = query.lower()
+    for greeting in greeting_keywords:
+        if re.search(r'\b' + re.escape(greeting) + r'\b', query_lower):
+            return True
+    return False
+
 # Take user input
 query = st.chat_input('Enter your question here: ')
 
@@ -125,18 +160,64 @@ if query:
     with st.chat_message("user"):
         st.markdown(query)
 
-    # Store the conversation history for the last 5 user exchanges
-    conversation_history = "\n".join([msg["content"] for msg in st.session_state.messages[-3:]])
+    # Check if the user's query is a greeting
+    if is_greeting(query):
+        template = """
+            User has greeted with the following message: "{query}".
+            Your task is to acknowledge the greeting in a friendly manner and offer assistance. 
+            You should maintain a welcoming and approachable tone.
+            Provide a response that feels natural, such as offering help or asking how you can assist further.
+        """
+        prompt = PromptTemplate(
+            template=template,
+            input_variables=['query']
+        )
+        chain = LLMChain(prompt=prompt,
+                         llm=llm,
+                         output_parser=parser)
+        response = chain.run(query)
 
-    # Format the prompt with the user's query and the conversation history
-    formatted_prompt = prompt.format(question=query,context=conversation_history)
-
-    # Check if the user's query has already been answered
-    if any(msg['content'].lower() == query.lower() for msg in st.session_state.messages):
-        response = "It looks like we already discussed that. Is there anything else you'd like to know?"
     else:
-        # Get a response from the Conversational Retrieval Chain
-        response = qa_chain.run({'question': formatted_prompt})
+        # Store the conversation history for the last 5 user exchanges
+        conversation_history = "\n".join([msg["content"] for msg in st.session_state.messages[-3:]])
+
+        # Perform similarity search on the Pinecone vector store
+        try:
+            retrieved_docs = vector_store.similarity_search_with_score(query)            
+        except PineconeApiAttributeError as e:
+            warnings.warn(f"Error retrieving documents: {e}")
+            retrieved_docs = []
+        except Exception as e:
+            warnings.warn(f"Error retrieving documents: {e}")
+            retrieved_docs = []
+        
+        if not retrieved_docs:
+            # If no relevant results are returned, respond with a default message
+            response = "I'm sorry, I couldn't find any information related to that. Could you please clarify or ask something else?"
+
+        # Extract text from page_content
+        texts = []
+
+        for doc, score in retrieved_docs:  # Unpacking document and similarity score
+            try:
+                # Parse the page_content as JSON
+                parsed_content = json.loads(doc.page_content)
+                texts.append(parsed_content["text"])  # Extract and store the text
+            except (json.JSONDecodeError, KeyError):
+                continue  # Skip if parsing fails
+
+        # Combine all extracted text into a single string
+        context = "\n".join(set(texts))  # Use set() to remove duplicates
+
+        # Format the prompt with the user's query and the conversation history
+        formatted_prompt = prompt.format(question=query,context=context,chat_history=conversation_history)
+
+        # Check if the user's query has already been answered
+        if any(msg['content'].lower() == query.lower() for msg in st.session_state.messages):
+            response = "It looks like we already discussed that. Is there anything else you'd like to know?"
+        else:
+            # Get a response from the Conversational Retrieval Chain
+            response = qa_chain.run({'question': formatted_prompt})
 
     # Store the user's query in the chat history
     st.session_state.messages.append({'role': 'user', 'content': query})
