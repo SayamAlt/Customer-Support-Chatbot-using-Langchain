@@ -5,5 +5,4 @@ langchain-community
 openai
 jq
 chromadb
-pysqlite3-binary
-sqlite3==3.43.2
+pysqlite3
